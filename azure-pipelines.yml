@@ -1,0 +1,39 @@
+trigger:
+- main
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+- stage: Syntax
+  displayName: 'Syntax check'
+  jobs:
+  - job: compileall
+    displayName: 'Compile all .py files'
+    steps:
+    - script: python -m compileall -q .
+      displayName: 'python -m compileall'
+
+- stage: Test
+  displayName: 'Unit tests'
+  dependsOn: Syntax
+  jobs:
+  - job: pytest
+    displayName: 'Run pytest'
+    steps:
+    - script: pip install -r requirements.txt pytest httpx
+      displayName: 'Install dependencies'
+    - script: pytest --junitxml=test-results.xml
+      displayName: 'Run tests'
+    - task: PublishTestResults@2
+      condition: always()
+      displayName: 'Publish test results'
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: 'test-results.xml'
+    - task: PublishBuildArtifacts@1
+      condition: always()
+      displayName: 'Publish test results artifact'
+      inputs:
+        PathtoPublish: 'test-results.xml'
+        ArtifactName: 'test-results'
