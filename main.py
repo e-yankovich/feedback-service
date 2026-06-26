@@ -37,6 +37,10 @@ CONNECTION_STRING = (
 )
 
 
+class InvalidFeedbackMessage(Exception):
+    pass
+
+
 def get_db_connection():
     return pyodbc.connect(CONNECTION_STRING)
 
@@ -86,16 +90,21 @@ def save_feedback(message_body: dict):
     comment = message_body.get("comment")
 
     if not ride_id or not driver_id:
-        print(f"[save_feedback] Skipping message without rideId/driverId: {message_body}")
-        return
+        raise InvalidFeedbackMessage(f"missing rideId/driverId: {message_body}")
 
-    if rating is not None and (rating < 1 or rating > 5):
-        print(f"[save_feedback] Invalid rating {rating}, storing as NULL.")
-        rating = None
+    if rating is None or rating < 1 or rating > 5:
+        raise InvalidFeedbackMessage(f"rating must be between 1 and 5, got {rating}")
 
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT 1 FROM [{SCHEMA_NAME}].[{TABLE_NAME}] WHERE RideId = ?",
+            ride_id,
+        )
+        if cursor.fetchone() is not None:
+            print(f"[save_feedback] Feedback for ride {ride_id} already exists, skipping.")
+            return
         cursor.execute(
             f"""
             INSERT INTO [{SCHEMA_NAME}].[{TABLE_NAME}]
@@ -130,6 +139,13 @@ def process_service_bus_messages():
                     body = json.loads(raw)
                     save_feedback(body)
                     receiver.complete_message(message)
+                except InvalidFeedbackMessage as exc:
+                    print(f"[service_bus] Dead-lettering invalid message: {exc}")
+                    receiver.dead_letter_message(
+                        message,
+                        reason="InvalidFeedback",
+                        error_description=str(exc),
+                    )
                 except Exception as exc:
                     print(f"[service_bus] Failed to process message: {exc}")
                     receiver.abandon_message(message)

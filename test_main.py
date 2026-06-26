@@ -13,15 +13,19 @@ client = TestClient(main.app)
 # --- DB fakes ---
 
 class FakeCursor:
-    def __init__(self, rows=None, execute_error=None):
+    def __init__(self, rows=None, execute_error=None, existing=None):
         self._rows = rows or []
         self._execute_error = execute_error
+        self._existing = existing
         self.executed = []
 
     def execute(self, sql, *params):
         if self._execute_error is not None:
             raise self._execute_error
         self.executed.append((sql, params))
+
+    def fetchone(self):
+        return self._existing
 
     def fetchall(self):
         return self._rows
@@ -69,6 +73,7 @@ class FakeReceiver:
         self._messages = messages
         self.completed = []
         self.abandoned = []
+        self.dead_lettered = []
 
     def __enter__(self):
         return self
@@ -84,6 +89,9 @@ class FakeReceiver:
 
     def abandon_message(self, message):
         self.abandoned.append(message)
+
+    def dead_letter_message(self, message, reason=None, error_description=None):
+        self.dead_lettered.append((message, reason, error_description))
 
 
 class FakeServiceBusClient:
@@ -195,30 +203,42 @@ def test_save_feedback_inserts(monkeypatch):
 
     assert conn.committed is True
     assert conn.closed is True
-    assert len(cursor.executed) == 1
-    params = cursor.executed[0][1]
+    assert len(cursor.executed) == 2
+    params = cursor.executed[-1][1]
     assert "ride-1" in params and "driver-1" in params and 4 in params
 
 
-def test_save_feedback_skips_without_ride_or_driver(monkeypatch):
+def test_save_feedback_skips_duplicate_ride(monkeypatch):
+    cursor = FakeCursor(existing=(1,))
+    conn = patch_db(monkeypatch, cursor)
+
+    main.save_feedback({"rideId": "ride-1", "driverId": "driver-1", "rating": 4})
+
+    assert len(cursor.executed) == 1
+    assert conn.committed is False
+
+
+def test_save_feedback_rejects_without_ride_or_driver(monkeypatch):
     cursor = FakeCursor()
     conn = patch_db(monkeypatch, cursor)
 
-    main.save_feedback({"driverId": "driver-1"})
+    with pytest.raises(main.InvalidFeedbackMessage):
+        main.save_feedback({"driverId": "driver-1"})
 
     assert cursor.executed == []
     assert conn.committed is False
 
 
-def test_save_feedback_invalid_rating_stored_null(monkeypatch):
+@pytest.mark.parametrize("rating", [0, 6, None])
+def test_save_feedback_rejects_invalid_rating(monkeypatch, rating):
     cursor = FakeCursor()
-    patch_db(monkeypatch, cursor)
+    conn = patch_db(monkeypatch, cursor)
 
-    main.save_feedback({"rideId": "ride-1", "driverId": "driver-1", "rating": 9})
+    with pytest.raises(main.InvalidFeedbackMessage):
+        main.save_feedback({"rideId": "ride-1", "driverId": "driver-1", "rating": rating})
 
-    params = cursor.executed[0][1]
-    assert None in params
-    assert 9 not in params
+    assert cursor.executed == []
+    assert conn.committed is False
 
 
 # --- process_service_bus_messages ---
@@ -226,7 +246,9 @@ def test_save_feedback_invalid_rating_stored_null(monkeypatch):
 def test_process_messages_completes_on_success(monkeypatch):
     cursor = FakeCursor()
     patch_db(monkeypatch, cursor)
-    message = FakeMessage(json.dumps({"rideId": "ride-1", "driverId": "driver-1"}))
+    message = FakeMessage(
+        json.dumps({"rideId": "ride-1", "driverId": "driver-1", "rating": 5})
+    )
     receiver = FakeReceiver([message])
     monkeypatch.setattr(
         main.ServiceBusClient,
@@ -238,7 +260,28 @@ def test_process_messages_completes_on_success(monkeypatch):
 
     assert receiver.completed == [message]
     assert receiver.abandoned == []
-    assert len(cursor.executed) == 1
+    assert len(cursor.executed) == 2
+
+
+def test_process_messages_dead_letters_invalid_rating(monkeypatch):
+    cursor = FakeCursor()
+    patch_db(monkeypatch, cursor)
+    message = FakeMessage(
+        json.dumps({"rideId": "ride-1", "driverId": "driver-1", "rating": 9})
+    )
+    receiver = FakeReceiver([message])
+    monkeypatch.setattr(
+        main.ServiceBusClient,
+        "from_connection_string",
+        classmethod(lambda cls, conn_str: FakeServiceBusClient(receiver)),
+    )
+
+    main.process_service_bus_messages()
+
+    assert [m for m, _, _ in receiver.dead_lettered] == [message]
+    assert receiver.completed == []
+    assert receiver.abandoned == []
+    assert cursor.executed == []
 
 
 def test_process_messages_abandons_on_bad_payload(monkeypatch):
